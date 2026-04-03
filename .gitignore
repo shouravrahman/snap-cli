@@ -1,0 +1,10 @@
+# Dependencies
+node_modules/
+
+# Snapshots output (default directory)
+snapshots/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
