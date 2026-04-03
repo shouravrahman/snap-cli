@@ -1,189 +1,333 @@
 #!/usr/bin/env node
+
+/**
+ * Snap CLI Tool - Automated Visual Snapshots
+ * Professional Refactor for Production/NPM
+ * Author: Shourav & Antigravity
+ */
+
 const { chromium } = require('playwright');
 const { Command } = require('commander');
 const fs = require('fs-extra');
 const path = require('path');
-const pLimit = require('p-limit'); // For concurrency control
+const pkg = require('./package.json');
+
+// Optional Dependencies
+let cliProgress;
+let cosmiconfig;
+let pLimit;
+
+/**
+ * Gracefully load dependencies to ensure robustness
+ */
+async function loadDependencies() {
+  try {
+    pLimit = (await import('p-limit')).default;
+  } catch (e) {
+    console.error('❌ Error: p-limit is required. Please install it.');
+    process.exit(1);
+  }
+
+  try {
+    cliProgress = require('cli-progress');
+  } catch (e) {
+    cliProgress = null;
+  }
+
+  try {
+    const { cosmiconfig: cc } = require('cosmiconfig');
+    cosmiconfig = cc;
+  } catch (e) {
+    cosmiconfig = null;
+  }
+}
 
 const program = new Command();
 
 program
-  .version('1.0.0')
-  .description('Snapshot a local web application')
-  .option('-u, --url <url>', 'The base URL of the local app', 'http://localhost:3000')
-  .option('-o, --output <dir>', 'The directory to save snapshots', './snapshots')
+  .version(pkg.version)
+  .description('Professional snapshot tool for web applications')
+  .option('-u, --url <url>', 'Base URL of the application', 'http://localhost:3000')
+  .option('-o, --output <dir>', 'Output directory for snapshots', './snapshots')
+  .option('--config <path>', 'Path to a configuration file')
+  // Auth
   .option('--login-url <url>', 'URL of the login page')
-  .option('--username <char>', 'Username for authentication')
-  .option('--password <char>', 'Password for authentication')
+  .option('--interactive', 'Open a visible browser for manual login')
+  .option('--storage-state <path>', 'Path to save/load auth state', 'snap-session.json')
+  .option('--username <char>', 'Username (for automated login)')
+  .option('--password <char>', 'Password (for automated login)')
   .option('--user-selector <selector>', 'CSS selector for username input', '#username')
-  .option('--pass-selector <selector>', 'CSS selector for password input', '#password') // Corrected option name
-  .option('--submit-selector <selector>', 'CSS selector for login button', 'button[type="submit"]') // Corrected option name
-  .option('-c, --concurrency <number>', 'Number of pages to process in parallel', parseInt, 3) // New concurrency option
+  .option('--pass-selector <selector>', 'CSS selector for password input', '#password')
+  .option('--submit-selector <selector>', 'CSS selector for login button', 'button[type="submit"]')
+  // Advanced Features
+  .option('--cookie-selector <selector>', 'CSS selector for "Accept" or "Close" cookie banner button')
+  .option('--ignore-selectors <selectors>', 'Comma-separated CSS selectors to hide')
+  .option('--exclude-urls <patterns>', 'Comma-separated regex patterns to exclude URLs')
+  .option('--max-depth <number>', 'Maximum crawl depth', (val) => parseInt(val, 10), Infinity)
+  .option('--delay <ms>', 'Delay before snapshots (ms)', (val) => parseInt(val, 10), 1000)
+  .option('-c, --concurrency <number>', 'Number of pages to process in parallel', (val) => parseInt(val, 10), 3)
+  .option('--viewports <list>', 'Custom viewports (e.g., "desktop:1920x1080,mobile:375x667")')
   .parse(process.argv);
 
-const options = program.opts();
+/**
+ * Merges Command-line options with Config File options
+ */
+async function getMergedOptions() {
+  const cliOptions = program.opts();
+  let configOptions = {};
 
-const VIEWPORTS = [
-  { name: 'mobile', width: 375, height: 667 },
-  { name: 'tablet', width: 768, height: 1024 },
-  { name: 'desktop', width: 1280, height: 720 },
-];
+  if (cosmiconfig) {
+    const explorer = cosmiconfig('snap');
+    const result = cliOptions.config 
+      ? await explorer.load(path.resolve(cliOptions.config)) 
+      : await explorer.search();
+    
+    if (result && result.config) {
+      configOptions = result.config;
+      console.log(`⚙️ Loaded configuration from ${result.filepath}`);
+    }
+  }
 
-// Store data about each snapshot for gallery generation
-const snapshotData = [];
+  return { ...cliOptions, ...configOptions };
+}
 
 /**
- * Normalizes a URL by removing hashes, queries, and trailing slashes.
+ * Normalizes viewport strings into structured objects
  */
-function normalizeUrl(url) {
-  const u = new URL(url);
-  u.hash = '';
-  u.search = '';
-  return u.origin + u.pathname.replace(/\/$/, '') || '/';
+function parseViewports(viewportStr) {
+  if (!viewportStr) {
+    return [
+      { name: 'mobile', width: 375, height: 667 },
+      { name: 'tablet', width: 768, height: 1024 },
+      { name: 'desktop', width: 1280, height: 720 },
+    ];
+  }
+
+  return viewportStr.split(',').map(v => {
+    const [name, res] = v.trim().split(':');
+    if (!res) return { name, width: 1280, height: 720 };
+    const [width, height] = res.split('x').map(n => parseInt(n, 10));
+    return { name, width: width || 1280, height: height || 720 };
+  });
+}
+
+function normalizeUrl(url, baseUrl) {
+  try {
+    const u = new URL(url, baseUrl);
+    u.hash = '';
+    u.search = '';
+    return u.origin + u.pathname.replace(/\/$/, '') || '/';
+  } catch (e) {
+    return url;
+  }
 }
 
 async function takeSnapshots() {
-  const browser = await chromium.launch();
-  // Using a single context ensures cookies/storage are shared across pages
-  const context = await browser.newContext();
-  
-  // Initial page for authentication, will be closed after login
-  const authPage = await context.newPage(); 
-  const visited = new Set();
-  const startUrl = normalizeUrl(options.url);
-  const urlsToCrawl = new Set([startUrl]); 
+  await loadDependencies();
+  const options = await getMergedOptions();
+  const viewports = parseViewports(options.viewports);
   const outputDir = path.resolve(options.output);
-
-  // Ensure output directory exists
+  const startUrl = normalizeUrl(options.url);
+  const storagePath = path.resolve(options.storageState);
+  
   await fs.ensureDir(outputDir);
 
-  // 1. Handle Authentication
-  if (options.loginUrl && options.username && options.password) {
-    console.log(`🔐 Logging in at ${options.loginUrl}...`);
+  // Check for existing session
+  let storageState = null;
+  if (fs.existsSync(storagePath)) {
+    storageState = storagePath;
+    console.log(`📦 Loading existing session from ${options.storageState}`);
+  }
+
+  // 1. Authentication Stage (Interactive or Automated)
+  if (options.interactive) {
+    console.log('🖥️ Entering Interactive Login Mode...');
+    const authBrowser = await chromium.launch({ headless: false });
+    const authContext = await authBrowser.newContext({ storageState: storageState || undefined });
+    const authPage = await authContext.newPage();
+    
+    await authPage.goto(options.loginUrl || options.url);
+    
+    console.log('\n------------------------------------------------------------');
+    console.log('👉 PLEASE LOGIN MANUALLY IN THE OPEN BROWSER WINDOW.');
+    console.log('👉 Once logged in, come back here and press ENTER to continue.');
+    console.log('------------------------------------------------------------\n');
+
+    await new Promise(resolve => process.stdin.once('data', resolve));
+    
+    await authContext.storageState({ path: storagePath });
+    console.log(`✅ Session saved to ${options.storageState}`);
+    await authBrowser.close();
+    storageState = storagePath;
+  } else if (options.loginUrl && options.username && options.password) {
+    // Automated Login (Legacy/Basic)
+    console.log(`🔐 Automated login at ${options.loginUrl}...`);
+    const authBrowser = await chromium.launch({ args: ['--no-sandbox'] });
+    const authContext = await authBrowser.newContext();
+    const authPage = await authContext.newPage();
     try {
       await authPage.goto(options.loginUrl, { waitUntil: 'networkidle' });
       await authPage.fill(options.userSelector, options.username);
-      // Corrected option names: pass_selector -> passSelector, submit_selector -> submitSelector
       await authPage.fill(options.passSelector, options.password); 
       await authPage.click(options.submitSelector);
       await authPage.waitForLoadState('networkidle');
-      console.log('✅ Login successful.');
+      await authContext.storageState({ path: storagePath });
+      storageState = storagePath;
+      console.log('✅ Automated login successful. Session saved.');
     } catch (err) {
-      console.error(`❌ Login failed: ${err.message}`);
-      process.exit(1);
+      console.error(`❌ Automated login failure: ${err.message}`);
+    } finally {
+      await authBrowser.close();
     }
   }
-  await authPage.close(); // Close the auth page, context maintains session
 
-  console.log(`🚀 Starting snapshots for ${options.url} with ${options.concurrency} concurrent workers...`);
+  // 2. Main Snapshotting Process
+  const browser = await chromium.launch({ 
+    args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'] 
+  });
+  
+  const context = await browser.newContext({ storageState: storageState || undefined });
 
-  const limit = pLimit(options.concurrency); // Initialize p-limit for concurrency control
+  const excludePatterns = options.excludeUrls
+    ? options.excludeUrls.split(',').map(p => new RegExp(p.trim()))
+    : [];
+  const isExcluded = (url) => excludePatterns.some(regex => regex.test(url));
 
-  async function crawlAndCapture(url) {
+  // 3. Crawler Setup
+  const visited = new Set();
+  const urlsToCrawl = new Map([[startUrl, 0]]);
+  const snapshotData = [];
+  const limit = pLimit(options.concurrency);
+  
+  // Progress Reporting
+  let bar;
+  if (cliProgress) {
+    bar = new cliProgress.SingleBar({
+      format: '🚢 Snapshot Progress | {bar} | {percentage}% | {value}/{total} Pages | Current: {url}',
+      hideCursor: true
+    }, cliProgress.Presets.shades_classic);
+    bar.start(1, 0, { url: 'Starting...' });
+  }
+
+  async function crawlAndCapture(url, depth) {
     const normalized = normalizeUrl(url);
-    if (visited.has(normalized) || !normalized.startsWith(normalizeUrl(options.url))) {
-      return; // Skip if already visited or external
-    }
-    visited.add(normalized); // Mark as visited early
+    if (visited.has(normalized)) return;
+    visited.add(normalized);
 
-    console.log(`📸 Capturing: ${normalized}`);
-    const page = await context.newPage(); // Each concurrent task gets its own page
+    if (isExcluded(normalized) || !normalized.startsWith(startUrl) || depth > (options.maxDepth || Infinity)) {
+      return;
+    }
+
+    if (bar) bar.update(visited.size, { url: normalized.replace(startUrl, '') || '/' });
+    else console.log(`📸 Capturing: ${normalized}`);
+
+    const page = await context.newPage();
     try {
       await page.goto(url, { waitUntil: 'networkidle' });
 
-      // Generate a filename based on the URL path
+      // Dismiss Cookie Banner if selector provided
+      if (options.cookieSelector) {
+        const cookieBtn = await page.$(options.cookieSelector);
+        if (cookieBtn) {
+          await cookieBtn.click().catch(() => {});
+          await page.waitForTimeout(500); // Wait for modal to close
+        }
+      }
+
+      // Hide Ads/Overlays via ignore-selectors
+      if (options.ignoreSelectors) {
+        const style = options.ignoreSelectors.split(',').map(s => `${s.trim()} { display: none !important; }`).join(' ');
+        await page.addStyleTag({ content: style }).catch(() => {});
+      }
+
+      // Allow for dynamic content or transitions to finish
+      await page.waitForTimeout(options.delay || 500);
+
       const urlObj = new URL(url);
       let pageName = urlObj.pathname === '/' ? 'index' : urlObj.pathname.replace(/\//g, '-');
       if (pageName.startsWith('-')) pageName = pageName.substring(1);
       
       const currentPageSnapshots = { url, pageName, snapshots: [] };
 
-      // 2. Loop through viewports for each page in parallel
-      await Promise.all(VIEWPORTS.map(async (vp) => {
+      // Iterate through all viewports
+      for (const vp of viewports) {
         await page.setViewportSize({ width: vp.width, height: vp.height });
-        // Wait a small amount for responsive transitions
-        await page.waitForTimeout(500); 
+        await page.waitForTimeout(300); // Small buffer for responsive reflows
         const imagePath = path.join(outputDir, `${pageName}-${vp.name}.png`);
-        await page.screenshot({
-          path: imagePath,
-          fullPage: true
+        await page.screenshot({ path: imagePath, fullPage: true });
+        currentPageSnapshots.snapshots.push({ 
+          viewport: vp.name, 
+          path: path.relative(outputDir, imagePath) 
         });
-        // Store relative path for HTML gallery
-        currentPageSnapshots.snapshots.push({ viewport: vp.name, path: path.relative(outputDir, imagePath) });
-      }));
-      snapshotData.push(currentPageSnapshots); // Add page's snapshot data to the global array
+      }
+      snapshotData.push(currentPageSnapshots);
 
-      // Find all links on the current page to crawl further
-      const links = await page.evaluate(() => {
+      // Discovery Phase - Find new internal links
+      const links = await page.evaluate((baseUrl) => {
         return Array.from(document.querySelectorAll('a'))
-          .map(a => a.href)
+          .map(a => a.href.split('#')[0]) // Strip anchors
           .filter(href => {
-            return href.startsWith(window.location.origin) && 
-                   !href.match(/\.(pdf|zip|jpg|png|gif|svg)$/i);
+            return href.startsWith(baseUrl) && 
+                   !href.match(/\.(pdf|zip|jpg|png|gif|svg|exe|dmg)$/i);
           });
-      });
+      }, startUrl);
 
       for (const link of links) {
-        const cleanLink = normalizeUrl(link);
-        if (!visited.has(cleanLink)) {
-          urlsToCrawl.add(cleanLink); // Add to the set of URLs to be processed
+        const cleanLink = normalizeUrl(link, startUrl);
+        if (!visited.has(cleanLink) && !urlsToCrawl.has(cleanLink) && 
+            !isExcluded(cleanLink) && (depth + 1) <= (options.maxDepth || Infinity)) {
+          urlsToCrawl.set(cleanLink, depth + 1);
+          if (bar) bar.setTotal(urlsToCrawl.size);
         }
       }
     } catch (err) {
-      console.error(`❌ Failed to capture ${url}: ${err.message}`);
+      if (bar) bar.stop();
+      console.error(`❌ Capture failed for ${url}: ${err.message}`);
+      if (bar) bar.start(urlsToCrawl.size, visited.size);
     } finally {
-      await page.close(); // Close the page after processing
+      await page.close();
     }
   }
 
-  let previousSize = 0;
-  // Keep crawling until no new unique URLs are found in an iteration
-  while (urlsToCrawl.size > previousSize || urlsToCrawl.size > visited.size) {
-    previousSize = urlsToCrawl.size;
-    // Filter out already visited URLs for the current batch
-    const currentBatch = Array.from(urlsToCrawl).filter(url => !visited.has(url));
-    if (currentBatch.length === 0 && urlsToCrawl.size === visited.size) break; // All processed
+  // 3. Execution Loop
+  while (urlsToCrawl.size > visited.size) {
+    const currentBatch = Array.from(urlsToCrawl.entries())
+      .filter(([url]) => !visited.has(url));
+    
+    if (currentBatch.length === 0) break;
 
-    // Process the current batch of URLs concurrently
-    await Promise.all(currentBatch.map(url => limit(() => crawlAndCapture(url))));
+    // Process using p-limit to respect concurrency setting
+    await Promise.all(currentBatch.map(([url, depth]) => limit(() => crawlAndCapture(url, depth))));
   }
 
-  // Generate the HTML gallery after all snapshots are taken
-  await generateGalleryHtml(snapshotData, outputDir);
+  if (bar) bar.stop();
 
+  // 4. Reporting Phase
+  await generateGalleryHtml(snapshotData, outputDir, options.url);
   await browser.close();
-  console.log(`\n✅ Done! Snapshots saved to: ${outputDir}`);
+  console.log(`\n✅ Snapshots successfully saved to: ${outputDir}`);
 }
 
-/**
- * Generates an HTML gallery page from the collected snapshot data.
- * @param {Array} data - Array of objects containing page URL, name, and snapshot details.
- * @param {string} outputDir - The directory where the HTML file will be saved.
- */
-async function generateGalleryHtml(data, outputDir) {
+async function generateGalleryHtml(data, outputDir, appUrl) {
   let galleryContent = '';
-
   for (const pageData of data) {
     galleryContent += `
       <div class="page-section">
           <div class="page-header">
               <h2>${pageData.pageName.replace(/-/g, ' ').split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')}</h2>
-              <a href="${pageData.url}" target="_blank" rel="noopener noreferrer">(${pageData.url})</a>
+              <a href="${pageData.url}" target="_blank" rel="noopener noreferrer">${pageData.url}</a>
           </div>
           <div class="snapshots-container">
     `;
     for (const snapshot of pageData.snapshots) {
       galleryContent += `
               <div class="snapshot-item">
-                  <p>${snapshot.viewport.charAt(0).toUpperCase() + snapshot.viewport.slice(1)}</p>
-                  <img src="${snapshot.path}" alt="${pageData.pageName} - ${snapshot.viewport}">
+                  <p>${snapshot.viewport.toUpperCase()}</p>
+                  <img src="${snapshot.path}" alt="${pageData.pageName} - ${snapshot.viewport}" loading="lazy">
               </div>
       `;
     }
-    galleryContent += `
-          </div>
-      </div>
-    `;
+    galleryContent += `</div></div>`;
   }
 
   const htmlContent = `
@@ -192,109 +336,38 @@ async function generateGalleryHtml(data, outputDir) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Snapshots Gallery</title>
+    <title>Visual Review Gallery | ${appUrl}</title>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"; margin: 20px; background-color: #f4f4f4; color: #333; }
-        h1 { color: #0056b3; text-align: center; margin-bottom: 30px; }
-        p.generation-info { text-align: center; color: #666; margin-bottom: 40px; }
-        .gallery-container { max-width: 1200px; margin: 0 auto; padding: 0 15px; }
-        .page-section {
-            background-color: #fff;
-            border-radius: 8px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            margin-bottom: 40px;
-            padding: 25px;
-            border: 1px solid #e0e0e0;
-        }
-        .page-header {
-            display: flex;
-            flex-wrap: wrap;
-            align-items: center;
-            margin-bottom: 25px;
-            border-bottom: 1px solid #eee;
-            padding-bottom: 15px;
-        }
-        .page-header h2 {
-            margin: 0;
-            color: #2c3e50;
-            font-size: 1.8em;
-            flex-grow: 1;
-        }
-        .page-header a {
-            margin-left: 20px;
-            text-decoration: none;
-            color: #007bff;
-            font-size: 1em;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            max-width: 300px; /* Limit width for long URLs */
-        }
-        .page-header a:hover {
-            text-decoration: underline;
-        }
-        .snapshots-container {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 30px;
-            justify-content: center;
-        }
-        .snapshot-item {
-            border: 1px solid #ddd;
-            border-radius: 6px;
-            overflow: hidden;
-            background-color: #fcfcfc;
-            text-align: center;
-            box-shadow: 0 1px 4px rgba(0,0,0,0.08);
-            transition: transform 0.2s ease-in-out;
-        }
-        .snapshot-item:hover {
-            transform: translateY(-3px);
-        }
-        .snapshot-item img {
-            max-width: 100%;
-            height: auto;
-            display: block;
-            border-bottom: 1px solid #eee;
-            background-color: #fff; /* Ensure white background for transparent images */
-        }
-        .snapshot-item p {
-            margin: 12px 0;
-            font-weight: bold;
-            color: #555;
-            font-size: 1.1em;
-        }
-        @media (max-width: 768px) {
-            .page-header {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-            .page-header a {
-                margin-left: 0;
-                margin-top: 5px;
-                max-width: 100%;
-            }
-            .snapshots-container {
-                grid-template-columns: 1fr;
-            }
-        }
+        :root { --surface: #f8fafc; --card: #ffffff; --text: #0f172a; --muted: #64748b; --primary: #2563eb; --border: #e2e8f0; }
+        body { font-family: system-ui, -apple-system, sans-serif; margin: 40px; background: var(--surface); color: var(--text); line-height: 1.5; }
+        h1 { font-size: 2.25rem; font-weight: 800; text-align: center; margin-bottom: 8px; }
+        .generation-info { text-align: center; color: var(--muted); margin-bottom: 48px; font-size: 0.95rem; }
+        .gallery-container { max-width: 1400px; margin: 0 auto; }
+        .page-section { background: var(--card); border-radius: 16px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); margin-bottom: 64px; padding: 40px; border: 1px solid var(--border); }
+        .page-header { display: flex; align-items: baseline; justify-content: space-between; border-bottom: 2px solid #f1f5f9; padding-bottom: 16px; margin-bottom: 32px; }
+        .page-header h2 { margin: 0; font-size: 1.5rem; letter-spacing: -0.025em; }
+        .page-header a { font-size: 0.875rem; color: var(--primary); text-decoration: none; font-weight: 500; }
+        .page-header a:hover { text-decoration: underline; }
+        .snapshots-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 40px; }
+        .snapshot-item { background: #f8fafc; border-radius: 12px; overflow: hidden; border: 1px solid var(--border); transition: transform 0.2s ease-in-out; }
+        .snapshot-item:hover { transform: translateY(-4px); }
+        .snapshot-item img { width: 100%; height: auto; display: block; border-bottom: 1px solid var(--border); background: white; }
+        .snapshot-item p { margin: 16px; font-weight: 700; text-align: center; color: var(--muted); font-size: 0.75rem; letter-spacing: 0.1em; }
     </style>
 </head>
 <body>
     <div class="gallery-container">
-        <h1>Snapshots Gallery</h1>
-        <p class="generation-info">Generated on: ${new Date().toLocaleString()}</p>
-        <div id="gallery">
-            ${galleryContent}
-        </div>
+        <h1>Snap Review Gallery</h1>
+        <p class="generation-info">Snapshot of <strong>${appUrl}</strong> • Generated on ${new Date().toLocaleString()}</p>
+        <div id="gallery">${galleryContent}</div>
     </div>
 </body>
-</html>
-  `;
+</html>`;
 
-  const galleryPath = path.join(outputDir, 'index.html');
-  await fs.writeFile(galleryPath, htmlContent);
-  console.log(`\n🖼️ HTML gallery generated at: ${galleryPath}`);
+  await fs.writeFile(path.join(outputDir, 'index.html'), htmlContent);
 }
 
-takeSnapshots();
+takeSnapshots().catch(err => {
+  console.error('💥 Terminal Failure:', err);
+  process.exit(1);
+});
