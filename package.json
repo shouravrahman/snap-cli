@@ -1,6 +1,6 @@
 {
   "name": "snap-cli-tool",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Automated visual snapshots for local web applications",
   "main": "snap.js",
   "bin": {
